@@ -105,5 +105,9 @@ func (l *Limiter) Consume(ctx context.Context, key string, ruleID string) (Resul
 	}
 	rediskey := fmt.Sprintf("rl:%s:%s", ruleID, key)
 	allow, count, err := l.store.Increment(ctx, rediskey, rule.Window(), rule.LimitCount)
-	
+	remaining := rule.LimitCount - count
+	if remaining < 0 {
+		remaining = 0
+	}
+	return Result{Allowed: allow, Remaining: remaining, Limit: rule.LimitCount}, err
 }
