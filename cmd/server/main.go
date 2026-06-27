@@ -14,7 +14,7 @@ import (
 
 func main() {
 	// 1. Create the store (in-memory for now)
-	s := store.NewMemoryStore()
+	s := store.NewRedisStore("localhost:6379")
 
 	// 2. Create the limiter with that store
 	l := limiter.New(s)
