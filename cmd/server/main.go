@@ -1,56 +1,111 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"time"
 
 	"github.com/harshhsharmaa57/rate-limiter.git/gen/pb"
 	"github.com/harshhsharmaa57/rate-limiter.git/internal/limiter"
 	"github.com/harshhsharmaa57/rate-limiter.git/internal/server"
 	"github.com/harshhsharmaa57/rate-limiter.git/internal/store"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 )
 
 func main() {
-	// 1. Create the store (in-memory for now)
+	// Connect to PostgreSQL
+	db, err := store.OpenDB("postgres://rl:rl@localhost:5432/ratelimiter?sslmode=disable")
+	if err != nil {
+		log.Fatalf("database: %v", err)
+	}
+
+	// Create rule cache and start loading rules
+	ctx := context.Background()
+	ruleCache := store.NewRuleCache(db)
+	ruleCache.StartRefreshLoop(ctx, 30*time.Second)
+
+	// Create Redis store
 	s := store.NewRedisStore("localhost:6379")
 
-	// 2. Create the limiter with that store
-	l := limiter.New(s)
+	// Create the limiter with Redis store and rule cache
+	l := limiter.NewWithCache(s, ruleCache)
 
-	// 3. Add some rules so the server has something to use
-	l.AddRule(limiter.Rule{
-		ID:         "free-tier",
-		LimitCount: 10,
-		WindowMs:   60,
-	})
-
-	l.AddRule(limiter.Rule{
-		ID:         "pro-tier",
-		LimitCount: 1000,
-		WindowMs:   60,
-	})
-
-	// 4. Create your gRPC server implementation
+	// Create gRPC server implementation
 	srv := server.New(l)
 
-	// 5. Listen on port 50051 (conventional gRPC port)
+	// Start HTTP server for SSE dashboard (in background)
+	go func() {
+		http.HandleFunc("/quota", func(w http.ResponseWriter, r *http.Request) {
+			key := r.URL.Query().Get("key")
+			if key == "" {
+				http.Error(w, "key required", 400)
+				return
+			}
+
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+
+			ch := l.Subscribe(key)
+			defer l.Unsubscribe(key, ch)
+
+			flusher := w.(http.Flusher)
+
+			for {
+				select {
+				case event := <-ch:
+					data, _ := json.Marshal(event)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				case <-r.Context().Done():
+					return
+				}
+			}
+		})
+
+		http.HandleFunc("/fire", func(w http.ResponseWriter, r *http.Request) {
+			key := r.URL.Query().Get("key")
+			ruleID := r.URL.Query().Get("rule_id")
+			if ruleID == "" {
+				ruleID = "free-tier"
+			}
+
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+
+			result, err := l.Consume(r.Context(), key, ruleID)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(result)
+		})
+
+		log.Println("HTTP server listening on :8080")
+		http.ListenAndServe(":8080", nil)
+	}()
+
+	// Listen on port 50051
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	// 6. Create a gRPC server
+	// Create gRPC server
 	grpcServer := grpc.NewServer()
 
-	// 7. Register your implementation
+	// Register implementation
 	pb.RegisterRateLimiterServiceServer(grpcServer, srv)
-	reflection.Register(grpcServer)
 
 	log.Println("rate limiter listening on :50051")
 
-	// 8. Start serving (this blocks forever)
+	// Start serving
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

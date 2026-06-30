@@ -12,10 +12,6 @@ import (
 // Server implements the gRPC RateLimiterServiceServer interface.
 type Server struct {
 	pb.UnimplementedRateLimiterServiceServer
-	// ↑ IMPORTANT: Always embed this. It provides default "not implemented"
-	// responses for any RPCs you haven't implemented yet, so your code compiles
-	// even when your proto has more methods than you've written.
-
 	limiter *limiter.Limiter
 }
 
@@ -49,7 +45,7 @@ func (s *Server) CheckLimit(ctx context.Context, req *pb.LimitRequest) (*pb.Limi
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
 
-	result, err := s.limiter.Consume(ctx, req.Key, req.RuleId)
+	result, err := s.limiter.Check(ctx, req.Key, req.RuleId)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check: %v", err)
 	}
@@ -63,8 +59,31 @@ func (s *Server) CheckLimit(ctx context.Context, req *pb.LimitRequest) (*pb.Limi
 }
 
 // WatchQuota is a server-streaming RPC.
-// For now, implement a stub that immediately returns.
-// You'll implement the real version in Part 9.
 func (s *Server) WatchQuota(req *pb.WatchRequest, stream pb.RateLimiterService_WatchQuotaServer) error {
-	return nil
+	if req.Key == "" {
+		return status.Error(codes.InvalidArgument, "key is required")
+	}
+
+	ctx := stream.Context()
+
+	ch := s.limiter.Subscribe(req.Key)
+	defer s.limiter.Unsubscribe(req.Key, ch)
+
+	for {
+		select {
+		case event := <-ch:
+			err := stream.Send(&pb.QuotaUpdate{
+				Key:       event.Key,
+				Used:      event.Used,
+				Remaining: event.Remaining,
+				Exceeded:  event.Exceeded,
+			})
+			if err != nil {
+				return err
+			}
+
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
